@@ -1,73 +1,157 @@
+/*
+ ▄▄▄▄    ███▄ ▄███▓  ▄████  ▄▄▄██▀▀▀▓█████▄▄▄█████▓
+▓█████▄ ▓██▒▀█▀ ██▒ ██▒ ▀█▒   ▒██   ▓█   ▀▓  ██▒ ▓▒
+▒██▒ ▄██▓██    ▓██░▒██░▄▄▄░   ░██   ▒███  ▒ ▓██░ ▒░
+▒██░█▀  ▒██    ▒██ ░▓█  ██▓▓██▄██▓  ▒▓█  ▄░ ▓██▓ ░ 
+░▓█  ▀█▓▒██▒   ░██▒░▒▓███▀▒ ▓███▒   ░▒████▒ ▒██▒ ░ 
+░▒▓███▀▒░ ▒░   ░  ░ ░▒   ▒  ▒▓▒▒░   ░░ ▒░ ░ ▒ ░░   
+▒░▒   ░ ░  ░      ░  ░   ░  ▒ ░▒░    ░ ░  ░   ░    
+ ░    ░ ░      ░   ░ ░   ░  ░ ░ ░      ░    ░      
+ ░             ░         ░  ░   ░      ░  ░
+Permissions: 
+MLRSCargo.admin    Required for chat commands
+
+Chat Commands:
+/mlrscargotest   -  Give Admin MLRS Air Strike Smoke Signal
+/mlrscargoreset  -  Resets the MLRS on all cargoships
+*/
 using Facepunch;
+using Newtonsoft.Json;
 using Oxide.Core.Plugins;
 using System.Collections.Generic;
 using System.Linq;
-using System.Reflection;
 using UnityEngine;
 namespace Oxide.Plugins
 {
-    [Info("MLRSCargo", "bmgjet", "1.0.3")]
-    [Description("Places a MLRS on the front of CargoShip, Has a event to remotely trigger MLRS")]
+    [Info("MLRSCargo", "bmgjet", "1.0.6")]
+    [Description("Places a MLRS on the front of CargoShip")]
     public class MLRSCargo : RustPlugin
     {
-        //Remote Trigger Only
-        public static bool RemoteMode = true; //Must have spawnready enabled also since cant access cockpit
-
-        //Spawns it already loaded with rockets and aiming module
-        bool SpawnReady = true;
-        //Delay betwen Refill
-        int Delay = 600; //seconds (10sec is minimum, 600 default = 10mins)
-
-        //Show announcements in public chat
-        public bool PublicAnouncements = true;
-        //Steam ID to use profile pic as announcment chat icon
-        public string AnnouncementIcon = "76561199219302299";
-
-        //Cargo NPCs health multiplyer
-        float healthmulti = 3f;
-        //Radius to cast NPC Scan
-        float NPCRadius = 50f; //Scan first 1/4 of ship around MLRS
-        //Replace Kit
-        string Kitname = "";  //("" = No kit change)
-
-        //Play SFX over boombox from remote MLRS grenade
-        bool PlaySFX = true;
-        //URL to SFX (Must be a raw mp3 file)
-        string SFXURL = "https://github.com/bmgjet/RocketFail/blob/main/AirRaid.mp3?raw=true";
-
-        //Position on cargoship moved from dead center
-        Vector3 CargoOffset = new Vector3(0f, 9.5f, 76f);
-
+        public static MLRSCargo _plugin;
+        public List<MLRS> mlrs = new List<MLRS>();
+        //Active MRLS to limit to 1 user at a time.
+        public static bool active = false;        
+        //Last player to trigger event
+        public BasePlayer thrower;        
         //Show Debug Info
         bool showDebug = false;
+        //Admining Permission
+        public const string AdminPerm = "MLRSCargo.admin";
 
         //Reference Kits plugin so kits can be applied to NPCs
         [PluginReference]
         private Plugin Kits;
 
+        #region Configuration
+        private Configuration config;
+        private class Configuration
+        {
+            [JsonProperty("Use Remote Controlled Mode With a Air Strike Signal (Requires you also enabled SpawnReady)")]
+            public bool RemoteMode = false;
+
+            [JsonProperty("SpawnReady (MLRS Spawns Ready To Fire)")]
+            public bool Ready = false;
+
+            [JsonProperty("Cool Down Between MLRS Attacks")]
+            public int Delay = 600;
+
+            //Show announcements in public chat
+            [JsonProperty("Show Announcements In Public Chat")]
+            public bool PublicAnouncements = false;
+
+            [JsonProperty("Steam ID To Use As Profile Pic")]
+            //Steam ID to use profile pic as announcment chat icon
+            public string AnnouncementIcon = "76561199219302299";
+
+            //Cargo NPCs health multiplyer
+            [JsonProperty("Cargo NPCs Health Multiplyer (Boosts Health Of NPCs With In Radius)")]
+            public float healthmulti = 3f;
+
+            [JsonProperty("Cargo NPCs Scan Radius")]
+            //Radius to cast NPC Scan
+            public float NPCRadius = 50f; //Scan first 1/4 of ship around MLRS
+
+            [JsonProperty("Give Kit To Found NPCs (Leave Empty For Default)")]
+            public string Kitname = "";
+
+            [JsonProperty("Play Air Raid Siren On AirStrike Signal")]
+            //Play SFX over boombox from remote MLRS grenade
+            public  bool PlaySFX = true;
+
+            [JsonProperty("URL To Air Raid Sound Effect (Must Be Raw MP3 Stream)")]
+            //URL to SFX (Must be a raw mp3 file)
+            public string SFXURL = "https://github.com/bmgjet/RocketFail/blob/main/AirRaid.mp3?raw=true";
+
+            [JsonProperty("MLRS Offset On Cargoship")]
+            //Position on cargoship moved from dead center
+            public Vector3 CargoOffset = new Vector3(0f, 9.5f, 76f);
+
+            public string ToJson() => JsonConvert.SerializeObject(this);
+
+            public Dictionary<string, object> ToDictionary() => JsonConvert.DeserializeObject<Dictionary<string, object>>(ToJson());
+        }
+
+        protected override void LoadDefaultConfig() { config = new Configuration(); }
+        protected override void LoadConfig()
+        {
+            base.LoadConfig();
+            try
+            {
+                config = Config.ReadObject<Configuration>();
+                if (config == null) { throw new JsonException(); }
+
+                if (!config.ToDictionary().Keys.SequenceEqual(Config.ToDictionary(x => x.Key, x => x.Value).Keys))
+                {
+                    PrintWarning("Configuration appears to be outdated; updating and saving");
+                    SaveConfig();
+                }
+            }
+            catch
+            {
+                PrintWarning($"Configuration file {Name}.json is invalid; using defaults");
+                LoadDefaultConfig();
+            }
+        }
+        protected override void SaveConfig()
+        {
+            PrintWarning($"Configuration changes saved to {Name}.json");
+            Config.WriteObject(config, true);
+        }
+        #endregion Configuration
+
+        private void Init()
+        {
+            _plugin = this;
+            Unsubscribe("OnEntitySpawned");
+            permission.RegisterPermission(AdminPerm, this);
+        }
+
         //Remote control only disable mounting
         object CanMountEntity(BasePlayer bp, BaseMountable bm)
         {
-            if (RemoteMode && SpawnReady && bm.ShortPrefabName == "mlrs.entity")
+            if (bm.prefabID == 223554808)
             {
-                //Checks its a MLRS thats apart of the event
-                MLRSShoot s = bm.GetComponent<MLRSShoot>();
-                if (s != null)
+                if (config.RemoteMode && config.Ready)
                 {
-                    //Has token avaliable.
-                    if (s.Token)
+                    //Checks its a MLRS thats apart of the event
+                    MLRSShoot s = bm.GetComponent<MLRSShoot>();
+                    if (s != null)
                     {
-                        s.Token = false;
-                        //Gives tokwn to player
-                        GiveMLRSSignal(bp);
-                        //Disable Mount
-                        return true;
-                    }
-                    else
-                    {
-                        rust.SendChatMessage(bp, "<color=orange>Cargo MLRS</color>", "MLRS Remote signal has already been claimed", AnnouncementIcon);
-                        //Disable Mount
-                        return true;
+                        //Has token avaliable.
+                        if (s.Token)
+                        {
+                            s.Token = false;
+                            //Gives tokwn to player
+                            GiveMLRSSignal(bp);
+                            //Disable Mount
+                            return true;
+                        }
+                        else
+                        {
+                            rust.SendChatMessage(bp, "<color=orange>Cargo MLRS</color>", "MLRS signal has already been claimed", config.AnnouncementIcon);
+                            //Disable Mount
+                            return true;
+                        }
                     }
                 }
             }
@@ -82,17 +166,15 @@ namespace Oxide.Plugins
             if (cs != null)
             {
                 //Creates MLRS
-                timer.Once(5f, () =>
+                timer.Once(10f, () =>
                 {
                     AddMLRS(cs);
                 });
             }
         }
 
-        // public FieldInfo _mapMarkerPrefab = typeof(MLRS).GetField("mapMarkerPrefab", BindingFlags.NonPublic | BindingFlags.Instance);
         void OnEntitySpawned(MLRSRocket rocket)
         {
-            // Puts(_mapMarkerPrefab.GetValue(rocket).);
             //Checks if its one of the events rockets
             if (rocket != null && active)
             {
@@ -101,7 +183,8 @@ namespace Oxide.Plugins
                     //Sets rocket as last user to trigger the event
                     rocket.OwnerID = thrower.userID;
                     rocket.creatorEntity = thrower;
-                    global::BaseEntity baseEntity2 = GameManager.server.CreateEntity("assets/content/vehicles/mlrs/mlrsrocketmarker.prefab", rocket.transform.position, Quaternion.identity, true);
+                    //Create map markers since that event was missed with remote trigger.
+                    BaseEntity baseEntity2 = GameManager.server.CreateEntity("assets/content/vehicles/mlrs/mlrsrocketmarker.prefab", rocket.transform.position, Quaternion.identity, true);
                     baseEntity2.OwnerID = thrower.userID;
                     baseEntity2.Spawn();
                     baseEntity2.SetParent(rocket, true, false);
@@ -116,7 +199,7 @@ namespace Oxide.Plugins
             {
                 if (!entity.GetParentEntity().GetComponent<MLRSShoot>())
                     return;
-                if (SpawnReady)
+                if (config.Ready)
                     NextTick(player.EndLooting);
             }
             catch { }
@@ -125,20 +208,21 @@ namespace Oxide.Plugins
         void OnServerInitialized()
         {
             //Validate Settings
-            if (Delay < 10)
+            if (config.Delay < 10)
             {
                 Puts("Invalid Delay Must be 10 or greater!");
-                Delay = 10;
+                config.Delay = 10;
             }
-            if (RemoteMode && !SpawnReady)
+            if (config.RemoteMode && !config.Ready)
             {
                 Puts("Spawn Ready Must Be Used With Remote Mode Since CockPit Is Unavaliable!");
-                SpawnReady = true;
+                config.Ready = true;
             }
             //try catch since throws errors if server had crashed instead of clean shutdown while cargo is out.
             try
             {
-                ResetCargoMLRS();
+                Subscribe("OnEntitySpawned");
+                timer.Once(30,()=>{ResetCargoMLRS(); });
             }
             catch { }
         }
@@ -146,21 +230,14 @@ namespace Oxide.Plugins
         void Unload()
         {
             //Remove component
-            var objects = GameObject.FindObjectsOfType(typeof(MLRSShoot));
-            if (objects != null)
+            foreach(var ent in mlrs)
             {
-                foreach (var gameObj in objects)
-                {
-                    GameObject.Destroy(gameObj);
-                }
+                if(ent != null) { continue; }
+                if (!ent.IsDestroyed) { ent.Kill(); }
             }
+            _plugin = null;
         }
 
-        //Active flag to limit to 1 user at a time.
-        public static bool active = false;
-        //Last player to trigger event
-        BasePlayer thrower;
-        //Gets thrown or dropped smoke grenade as trigger for remote target.
         void OnExplosiveDropped(BasePlayer bp, BaseEntity be)
         {
             if (bp == null || be == null || be.ShortPrefabName != "grenade.smoke.deployed") return;
@@ -172,6 +249,20 @@ namespace Oxide.Plugins
             RemoteEvent(bp, be);
         }
 
+        private void OnCargoShipEgress(CargoShip cs)
+        {
+            if (cs != null)
+            {
+                for(int i = cs.children.Count - 1; i >=0; i--)
+                {
+                    if (cs.children[i] != null && !cs.children[i].IsDestroyed && cs.children[i] is MLRS)
+                    {
+                        cs.children[i].Kill();
+                    }
+                }
+            }
+        }
+
         void RemoteEvent(BasePlayer bp, BaseEntity be)
         {
             //Check if its an event token
@@ -180,14 +271,14 @@ namespace Oxide.Plugins
 
             RunEffect("assets/bundled/prefabs/fx/smoke_signal_full.prefab", be);
             //Checks if already active event
-            if (be != null && !active)
+            if ((be != null && !active) || !config.RemoteMode)
             {
                 bool Sucess = false;
                 thrower = bp;
                 active = true;
-                if (PlaySFX)
+                if (config.PlaySFX)
                 {
-                    CreateSound(be, SFXURL);
+                    CreateSound(be, config.SFXURL);
                 }
                 //delay to allow smoke grenade to travel
                 timer.Once(8f, () =>
@@ -195,16 +286,15 @@ namespace Oxide.Plugins
                     if (be == null)
                     {
                         active = false;
-                        rust.SendChatMessage(bp, "<color=orange>Cargo MLRS</color>", "Your MLRS remote signal <color=red>FAILED</color>", AnnouncementIcon);
+                        rust.SendChatMessage(bp, "<color=orange>Cargo MLRS</color>", "Your MLRS signal <color=red>FAILED</color>", config.AnnouncementIcon);
                         return;
                     }
                     Vector3 pos = be.transform.position;
                     if (pos != null)
                     {
-                        if (PublicAnouncements)
+                        if (config.PublicAnouncements)
                         {
                             CreateAnouncment("<color=red>" + bp.displayName + "</color> has called a MLRS strike near <color=orange>" + getGrid(pos) + "</color>");
-                            //PrintToChat("<color=orange>"+bp.displayName + "</color> has called a MLRS strike near <color=red>" + getGrid(pos)+"</color>");
                         }
                         //Find all cargo ships and use them
                         CargoShip[] cargo = UnityEngine.Object.FindObjectsOfType<CargoShip>();
@@ -228,7 +318,7 @@ namespace Oxide.Plugins
                                             //Check if any shots have been fired in the foreach loop to prevent refunds
                                             if (!Sucess)
                                             {
-                                                rust.SendChatMessage(bp, "<color=orange>Cargo MLRS</color>", "Cargo MLRS </color=red>Not Avaliable</color=red>", AnnouncementIcon);
+                                                rust.SendChatMessage(bp, "<color=orange>Cargo MLRS</color>", "<color=red>Not Avaliable</color=red>", config.AnnouncementIcon);
                                                 bp.GiveItem(CreateItem());
                                                 NextTick(() => { be?.Kill(); });
                                             }
@@ -241,15 +331,15 @@ namespace Oxide.Plugins
                                         Sucess = true;
                                         timer.Once(10f, () =>
                                         {
-                                            if (PublicAnouncements)
+                                            if (config.PublicAnouncements)
                                             {
                                                 CreateAnouncment("Status: <color=red>Disabled</color>");
                                             }
                                         });
                                         //Resets the cargo after delay
-                                        if (SpawnReady)
+                                        if (config.Ready)
                                         {
-                                            timer.Once(10 + Delay, () =>
+                                            timer.Once(10 + config.Delay, () =>
                                             {
                                                 ResetCargoMLRS();
                                             });
@@ -264,7 +354,7 @@ namespace Oxide.Plugins
             else
             {
                 //Returns players token
-                rust.SendChatMessage(bp, "<color=orange>Cargo MLRS</color>", "Cargo MLRS Not Avaliable", AnnouncementIcon);
+                rust.SendChatMessage(bp, "<color=orange>Cargo MLRS</color>", "<color=red>Not Avaliable</color=red>", config.AnnouncementIcon);
                 bp.GiveItem(CreateItem());
                 NextTick(() => { be?.Kill(); });
             }
@@ -308,7 +398,7 @@ namespace Oxide.Plugins
                 {
                     List<BaseEntity> bef = cargo.children;
                     {
-                        foreach (BaseEntity b in bef.ToArray())
+                        foreach (BaseEntity b in bef)
                         {
                             if (b is MLRS)
                             {
@@ -319,28 +409,41 @@ namespace Oxide.Plugins
                     }
                 }
             }
+            MLRS[] MLRSList = UnityEngine.Object.FindObjectsOfType<MLRS>();
+            foreach (MLRS mlrs in MLRSList)
+            {
+                if (mlrs == null) { continue; }
+                if (mlrs.transform.position.y == 0 && TerrainMeta.HeightMap.GetHeight(mlrs.transform.position) < -5)
+                {
+                    mlrs.Kill();
+                    cleaned++;
+                }
+            }
             if (showDebug) Puts("Cleaned " + cleaned.ToString() + " dupes");
         }
 
         void AddMLRS(CargoShip cs)
         {
-            CleanDupedMLRS(cs.transform.position + CargoOffset);
+            if (cs == null) { return; }
+            CleanDupedMLRS(cs.transform.position + config.CargoOffset);
             //Rotate MLRS so turret is at front of ship not to hit the mast.
             Vector3 rot = cs.transform.rotation.eulerAngles;
             rot = new Vector3(rot.x, rot.y + 180, rot.z);
             Vector3 pos = new Vector3(cs.transform.position.x, cs.transform.position.y, cs.transform.position.z);
             //Spawn MLRS
             MLRS replacement = GameManager.server.CreateEntity("assets/content/vehicles/mlrs/mlrs.entity.prefab", pos, cs.transform.rotation) as MLRS;
-            if (replacement == null) return;
+            if (replacement == null) { return; }
             replacement.Spawn();
             replacement.SetParent(cs);
+            mlrs.Add(replacement);
             replacement.transform.position = pos;
-            replacement.transform.localPosition += CargoOffset;
+            replacement.transform.localPosition += config.CargoOffset;
             replacement.transform.rotation = Quaternion.Euler(rot);
             replacement.enabled = true;
+            replacement.EnableSaving(false);
             //Add component to over-ride the shoot button and few functions
             replacement.gameObject.AddComponent<MLRSShoot>();
-            if (SpawnReady || RemoteMode)
+            if (config.Ready || config.RemoteMode)
             {
                 //Try catch since some times errors OnServerInitialized if server crashed,
                 try
@@ -352,13 +455,13 @@ namespace Oxide.Plugins
                 catch { }
             }
             replacement.SendNetworkUpdateImmediate();
-            if (PublicAnouncements)
+            if (config.PublicAnouncements)
             {
                 CreateAnouncment("Status: <color=green>Active</color>");
             }
             if (showDebug) Puts("Spawned new Cago MLRS");
             ////Change NPCs health to make them a little harder for MLRS event
-            if (healthmulti != 1f)
+            if (config.healthmulti != 1f)
             {
                 //Delay to allow NPCs to spawn
                 timer.Once(2f, () =>
@@ -379,7 +482,7 @@ namespace Oxide.Plugins
             if (item != null && player != null)
             {
                 player.GiveItem(item);
-                if (PublicAnouncements)
+                if (config.PublicAnouncements)
                 {
                     CreateAnouncment("MLRS Remote signal claimed by <color=red>" + player.displayName + "</color>");
                     //PrintToChat("MLRS Remote signal claimed by " + player.displayName);
@@ -455,10 +558,12 @@ namespace Oxide.Plugins
         //Gets grid letter from world position
         string getGrid(Vector3 pos)
         {
+            //Set base letter
             char letter = 'A';
             var x = Mathf.Floor((pos.x + (ConVar.Server.worldsize / 2)) / 146.3f) % 26;
             var z = (Mathf.Floor(ConVar.Server.worldsize / 146.3f)) - Mathf.Floor((pos.z + (ConVar.Server.worldsize / 2)) / 146.3f);
             letter = (char)(((int)letter) + x);
+            //-1 since starts at 0
             return $"{letter}{z - 1}";
         }
 
@@ -478,21 +583,9 @@ namespace Oxide.Plugins
             {
                 if (current.IsConnected)
                 {
-                    rust.SendChatMessage(current, "<color=orange>Cargo MLRS</color>", msg, AnnouncementIcon);
+                    rust.SendChatMessage(current, "<color=orange>Cargo MLRS</color>", msg, config.AnnouncementIcon);
                 }
             }
-
-        }
-
-        private bool IsKit(string kit)
-        {
-            //Call kit plugin check if its valid kit
-            var success = Kits?.Call("isKit", kit);
-            if (success == null || !(success is bool))
-            {
-                return false;
-            }
-            return (bool)success;
         }
 
         //FindNPCs and boost them
@@ -500,7 +593,7 @@ namespace Oxide.Plugins
         {
             int boosted = 0;
             //Scan area
-            RaycastHit[] hits = UnityEngine.Physics.SphereCastAll(pos.transform.position, NPCRadius, Vector3.one);
+            RaycastHit[] hits = UnityEngine.Physics.SphereCastAll(pos.transform.position, config.NPCRadius, Vector3.one);
             foreach (RaycastHit hit in hits.ToArray())
             {
                 //Check each hit is NPC
@@ -508,10 +601,10 @@ namespace Oxide.Plugins
                 if (bnpc != null)
                 {
                     //Checks if kit string is valid
-                    if (Kitname != "" && IsKit(Kitname))
+                    if (config.Kitname != "")
                     {
                         //Calls kits plugin
-                        object success = Kits?.Call("GiveKit", bnpc, Kitname);
+                        object success = Kits?.Call("GiveKit", bnpc, config.Kitname);
                         //Trys to equip stuff
                         Item projectileItem = null;
                         foreach (var item in bnpc.inventory.containerBelt.itemList)
@@ -531,8 +624,8 @@ namespace Oxide.Plugins
                     //Give a better name
                     bnpc.displayName = RandomUsernames.Get(bnpc.userID);
                     //Mod health
-                    bnpc.startHealth *= healthmulti;
-                    bnpc.InitializeHealth(100 * healthmulti, 100 * healthmulti);
+                    bnpc.startHealth *= config.healthmulti;
+                    bnpc.InitializeHealth(100 * config.healthmulti, 100 * config.healthmulti);
                     boosted++;
                 }
             }
@@ -542,14 +635,6 @@ namespace Oxide.Plugins
         //Functions for Cargo MLRS
         public class MLRSShoot : FacepunchBehaviour
         {
-            //Reflection to pull the functions from private MLRS class
-            public MethodInfo _fire = typeof(MLRS).GetMethod("Fire", BindingFlags.NonPublic | BindingFlags.Instance);
-            public MethodInfo _SetUserTargetHitPos = typeof(MLRS).GetMethod("SetUserTargetHitPos", BindingFlags.NonPublic | BindingFlags.Instance);
-            public MethodInfo _FireNextRocket = typeof(MLRS).GetMethod("FireNextRocket", BindingFlags.NonPublic | BindingFlags.Instance);
-            public PropertyInfo _IsRealigning = typeof(MLRS).GetProperty("IsRealigning");
-            public PropertyInfo _TrueHitPos = typeof(MLRS).GetProperty("TrueHitPos");
-            public PropertyInfo _UserTargetHitPos = typeof(MLRS).GetProperty("UserTargetHitPos");
-            public FieldInfo _nextRocketIndex = typeof(MLRS).GetField("nextRocketIndex", BindingFlags.NonPublic | BindingFlags.Instance);
             public bool Token = true;
             public MLRS me;
             public BasePlayer seatedplayer;
@@ -558,7 +643,7 @@ namespace Oxide.Plugins
                 //Gives reference
                 me = GetComponent<MLRS>();
                 //Check if should be monitoring Seat
-                if (!RemoteMode)
+                if (!_plugin.config.RemoteMode)
                 {
                     //Setup update loop
                     InvokeRepeating(update, UnityEngine.Random.Range(0f, 1f), 0.15f);
@@ -568,23 +653,23 @@ namespace Oxide.Plugins
             //Manually set the target
             public void SetTarget(Vector3 nt)
             {
-                _TrueHitPos.SetValue(me, nt);
-                _UserTargetHitPos.SetValue(me, nt);
-                _SetUserTargetHitPos.Invoke(me, new object[] { nt });
+                me.trueTargetHitPos = nt;
+                me.SetUserTargetHitPos(nt);
+                me.SetUserTargetHitPos(nt);
             }
 
             //Manually fire rockets
             public void ForceFire()
             {
-                _FireNextRocket.Invoke(me, null);
+                //_FireNextRocket.Invoke(me, null);
+                me.FireNextRocket();
             }
 
             public void ForceFireRepeat(BasePlayer bp)
             {
                 //Lock taget pos
-                me.SetFlag(global::BaseEntity.Flags.Reserved6, true, false, true);
-                //Sets next rocket to fire
-                _nextRocketIndex.SetValue(me, me.RocketAmmoCount - 1);
+                me.SetFlag(BaseEntity.Flags.Reserved6, true, false, true);
+                me.nextRocketIndex = me.RocketAmmoCount - 1;
                 //Fire rockets
                 InvokeRepeating(ForceFire, 0f, 0.5f);
             }
@@ -610,8 +695,8 @@ namespace Oxide.Plugins
                     if (seatedplayer != null && seatedplayer.serverInput.IsDown(BUTTON.FIRE_PRIMARY))
                     {
                         //Triggers normal fire function of press button
-                        _IsRealigning.SetValue(me, false);
-                        _fire.Invoke(me, new object[] { seatedplayer });
+                        me.IsRealigning = false;
+                        me.Fire(seatedplayer);
                     }
                 }
                 catch { }
@@ -620,11 +705,31 @@ namespace Oxide.Plugins
 
         //Debug comand
         [ChatCommand("mlrscargotest")]
-        private void CmdSafeSpaceCraft(BasePlayer player, string command, string[] args)
+        private void Cmdmlrscargotest(BasePlayer player, string command, string[] args)
         {
             //Gives admin token without having to visit cargoship
-            if (player.IsAdmin)
+            if (player.IPlayer.HasPermission(AdminPerm))
+            {
                 GiveMLRSSignal(player);
+            }
+            else
+            {
+                player.ChatMessage("No Perm");
+            }
+        }
+        //Reset event
+        [ChatCommand("mlrscargoreset")]
+        private void Cmdmlrscargoreset(BasePlayer player, string command, string[] args)
+        {
+            //Respawns MLRS
+            if (player.IPlayer.HasPermission(AdminPerm))
+            {
+                ResetCargoMLRS();
+            }
+            else
+            {
+                player.ChatMessage("No Perm");
+            }
         }
     }
 }
